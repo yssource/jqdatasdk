@@ -158,6 +158,28 @@ def normal_security_code(code):
         raise ParamsError("security type is invalid! type is {}".format(type(code)))
 
 
+def normalize_frequency(feq):
+    """
+    将行情周期转化为(倍数,周期)
+    :param feq: 行情周期
+    :return: (倍数,周期)
+    """
+    if feq == "daily" or feq == "1d":
+        return (1, "d")
+    elif feq == "minute" or feq == "1m":
+        return  (1, "m")
+    else:
+        if feq.startswith("0"):
+            raise ValueError("无效的行情周期")
+        else:
+            result = re.match("(?P<multiple>[0~9]{1,})(?P<base>[md]{1})", feq)
+            if not result:
+                raise ValueError("无效的行情周期")
+            else:
+                return (result.group("multiple"), result.group("base"))
+
+
+
 def to_date(date):
     """
     >>> convert_date('2015-1-1')
