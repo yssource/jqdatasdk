@@ -5,7 +5,7 @@ from .client import JQDataClient
 import pandas
 from datetime import timedelta
 from datetime import datetime
-from os.path import dirname, join
+from os.path import dirname, join, exists
 
 
 @assert_auth
@@ -31,9 +31,8 @@ def get_price(security, start_date="2015-01-01", end_date="2015-12-31", frequenc
     if count and start_date:
         raise ParamsError("(start_date, count) only one param is required")
 
-    # 目前还不知道后复权该如何处理
     if start == end and fq != "post":
-        # start == end一般为回测引擎调用，此时时启用缓存
+        # start == end一般为回测引擎调用，此时启用缓存
         if isinstance(scrty, str):
             return _fetch_data(security=scrty, start_date=start,
                                end_date=end, frequency=frequency, fields=fields,
@@ -110,27 +109,36 @@ def _load_data_from_cache(security, start_date="2015-01-01", end_date="2015-12-3
     resample_multiple, base = normalize_frequency(frequency)
     archive_file = _get_h5_archive_file(base)
     default_fields = ["open", "close", "low", "high", "volume", "money"]
+    if fields:
+        cols = ["pre_fq_factor", "post_fq_factor"] + fields
+    else:
+        cols = ["pre_fq_factor", "post_fq_factor"] + default_fields
     try:
+        # 利用pandas自带机制过滤出需要的数据
         if not count:
             query = "index>={0} & index<={1}".format(
                 pd.Timestamp(start).to_datetime64().astype(datetime),
                 pd.Timestamp(end).to_datetime64().astype(datetime))
-            if skip_paused:
-                query += " & (paused == False)"
             cached_data = pd.read_hdf(archive_file, key=name_convertion(scrty),
-                                      where=query, columns=default_fields if not fields else fields)
+                                      where=query, columns=cols)
         else:
-            query = "index<={0}& (paused == {1})".format(
+            query = "index<={0})".format(
                 pd.Timestamp(end).to_datetime64().astype(datetime),
                 skip_paused)
-            if skip_paused:
-                query += " & (paused == False)"
             cached_data = pd.read_hdf(archive_file, key=name_convertion(scrty),
-                                      where=query, columns=default_fields if not fields else fields)[-count:]
+                                      where=query, columns=cols)[-count:]
     except (KeyError, IOError):
-        return pandas.DataFrame()
+        return pandas.DataFrame(columns=cols)
     else:
-        return resample_data(cached_data, frequency)
+        if skip_paused:
+            cached_data = resample_data(_process_fq(cached_data[cached_data["paused"] == False], fq),
+                                        frequency)
+        else:
+            cached_data = resample_data(_process_fq(cached_data, fq),
+                                        frequency)
+        cached_data.drop(set(cached_data.columns) - set(fields if fields else default_fields),
+                         axis=1,inplace=True)
+        return cached_data.round(2)
 
 
 def _load_online_data(security, start_date="2015-01-01", end_date="2015-12-31",
@@ -149,7 +157,7 @@ def _load_online_data(security, start_date="2015-01-01", end_date="2015-12-31",
     :return: (供缓存的数据， 加工过的数据)
     """
     full_fields = ["open", "close", "low", "high", "volume", "money",
-     "factor", "high_limit", "low_limit", "pre_close", "paused"]
+                   "high_limit", "low_limit", "pre_close", "paused"]
     scrty = convert_security(security)
     start = to_date_str(start_date)
     end = to_date_str(end_date)
@@ -158,25 +166,37 @@ def _load_online_data(security, start_date="2015-01-01", end_date="2015-12-31",
     if count and start_date:
         raise ParamsError("(start_date, count) only one param is required")
     resample_multiple, base = normalize_frequency(frequency)
+    # 缓存的原始数据为未复权数据， 读取时本地手工复权
+    origin_feq = {"m": "1m", "d": "1d"}[base]
     origin_data = JQDataClient.instance().get_price(security=scrty, start_date=start,
-                                                    end_date=end, frequency={"m": "1m", "d": "1d"}[base],
-                                                    fields=full_fields, skip_paused=False, fq=fq, count=count)
-    # 当skip_paused == True， 过滤停盘并仅获取需要的数据字段
+                                                    end_date=end, frequency=origin_feq,
+                                                    fields=full_fields, skip_paused=False, fq=None, count=count)
+    # 获取前复权和后复权因子， 保存至本地
+    pre_fq_factor = JQDataClient.instance().get_price(security=scrty, start_date=start,
+                                                    end_date=end, frequency=origin_feq,
+                                                    fields=["factor"], skip_paused=False, fq="pre", count=count)
+    post_fq_factor = JQDataClient.instance().get_price(security=scrty, start_date=start,
+                                                    end_date=end, frequency=origin_feq,
+                                                    fields=["factor"], skip_paused=False, fq="post", count=count)
+    origin_data["pre_fq_factor"] = pre_fq_factor
+    origin_data["post_fq_factor"] = post_fq_factor
+
     if skip_paused:
-        data = JQDataClient.instance().get_price(security=scrty, start_date=start,
-                                                    end_date=end, frequency={"m": "1m", "d": "1d"}[base],
-                                                    fields=fields, skip_paused=True, fq=fq, count=count)
+        data = resample_data(_process_fq(origin_data[origin_data["paused"] == False], fq),
+                             frequency)
+
     else:
-        # 仅保留需要的数据字段
-        if fields:
-            data = origin_data.drop(set(full_fields) - set(fields), axis=1)
-        else:
-            data = origin_data.drop(set(full_fields) - {"open", "close", "low",
-                                                        "high", "volume", "money"}, axis=1)
-    return (origin_data, resample_data(data, frequency))
+        data = resample_data(_process_fq(origin_data, fq),
+                             frequency)
+
+    if fields:
+        return (origin_data, data.drop(set(data.columns) - set(fields), axis=1).round(2))
+    else:
+        return (origin_data, data.drop(set(data.columns) - {"open", "close", "low",
+                                              "high", "volume", "money"}, axis=1).round(2))
 
 
-import pandas
+# Todo: 处理周期重采样
 def resample_data(data, frequency):
     """
     对数据进行重采样
@@ -209,6 +229,42 @@ def resample_data(data, frequency):
         """
 
 
+def _process_fq(data, fq):
+
+    def _fq(df):
+        if "factor" not in df:
+            raise AttributeError("找不到复权因子")
+        else:
+            return df.apply(lambda x: pandas.Series({"open": x["open"] * x["factor"],
+                                                 "close": x["close"] * x["factor"],
+                                                 "low": x["low"] * x["factor"],
+                                                 "high": x["high"] * x["factor"],
+                                                 "volume": x["volume"] * x["factor"],
+                                                 "money": x["money"],
+                                                 "factor": x["factor"],
+                                                 "high_limit": x["high_limit"] * x["factor"],
+                                                 "low_limit": x["low_limit"] * x["factor"],
+                                                 "pre_close": x["pre_close"] * x["factor"],
+                                                 "paused": x["paused"]}, index=x.index), axis=1)
+
+    # 不复权
+    if not fq:
+        result = data.drop(("pre_fq_factor", "post_fq_factor"), axis=1)
+        result["factor"] = list(1 for _ in range(len(result)))
+        return result
+    # 前复权
+    elif fq == 'pre':
+        result = data.drop("post_fq_factor", axis=1)
+        result.rename(columns={"pre_fq_factor": "factor"}, inplace=True)
+        return _fq(result)
+    # 后复权
+    elif fq == "post":
+        result = data.drop("pre_fq_factor", axis=1)
+        result.rename(columns={"post_fq_factor": "factor"}, inplace=True)
+        return _fq(result)
+    else:
+        raise AttributeError("不支持的复权方式")
+
 import six
 def name_convertion(s):
     security = convert_security(s)
@@ -217,7 +273,7 @@ def name_convertion(s):
         return str("___" + security.replace(".", "___"))
     elif isinstance(security, list):
         # 3 underscodes
-        return [str(i.replace("___", "___")) for i in security]
+        return [str("___" + i.replace("___", "___")) for i in security]
 
 
 @assert_auth
