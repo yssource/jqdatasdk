@@ -3,14 +3,14 @@ from functools import wraps
 from .utils import *
 from .client import JQDataClient
 import pandas
-from datetime import timedelta
-from datetime import datetime
+from datetime import datetime, timedelta
 from os.path import dirname, join, exists
+from os import makedirs
 
 
 @assert_auth
 def get_price(security, start_date="2015-01-01", end_date="2015-12-31", frequency='daily',
-    fields=None, skip_paused=False, fq='pre', count=None):
+    fields=None, skip_paused=False, fq='pre', count=None, enable_cache=True):
     """
     获取一支或者多只证券的行情数据
 
@@ -23,6 +23,7 @@ def get_price(security, start_date="2015-01-01", end_date="2015-12-31", frequenc
     :param skip_paused 是否跳过不交易日期(包括停牌, 未上市或者退市后的日期). 如果不跳过, 停牌时会使用停牌前的数据填充, 上市前或者退市后数据都为 nan
     :return 如果是一支证券, 则返回pandas.DataFrame对象, 行索引是datetime.datetime对象, 列索引是行情字段名字; 如果是多支证券, 则返回pandas.Panel对象, 里面是很多pandas.DataFrame对象, 索引是行情字段(open/close/…), 每个pandas.DataFrame的行索引是datetime.datetime对象, 列索引是证券代号.
     """
+    default_fields = ["open", "close", "low", "high", "volume", "money"]
     scrty = convert_security(security)
     start = to_date_str(start_date)
     end = to_date_str(end_date)
@@ -30,75 +31,128 @@ def get_price(security, start_date="2015-01-01", end_date="2015-12-31", frequenc
             start = "2015-01-01"
     if count and start_date:
         raise ParamsError("(start_date, count) only one param is required")
-
-    if start == end and fq != "post":
-        # start == end一般为回测引擎调用，此时启用缓存
+    if enable_cache:
         if isinstance(scrty, str):
-            return _fetch_data(security=scrty, start_date=start,
+            return _fetch_data(security_code=scrty, start_date=start,
                                end_date=end, frequency=frequency, fields=fields,
                                skip_paused=skip_paused, fq=fq, count=count)
         else:
-            data = {s: _fetch_data(security=s, start_date=start,
-                               end_date=end, frequency=frequency, fields=fields,
+            data = {s: _fetch_data(security_code=s, start_date=start,
+                                   end_date=end, frequency=frequency, fields=default_fields,
                                    fq=fq, skip_paused=False, count=count) for s in scrty}
             return _convert_data_to_panel(data)
     else:
-        # start != end一般为用户调用sdk，不启用缓存
         return JQDataClient.instance().get_price(security=scrty, start_date=start,
                                                  end_date=end, frequency=frequency, fields=fields,
                                                  skip_paused=skip_paused, fq=fq, count=count)
 
 
 def _convert_data_to_panel(data):
-    return pandas.Panel(data)
+
+    if data:
+        # time_index = data.values()[0].index
+        fields = ["open", "close", "low", "high", "volume", "money"]
+        return pandas.Panel({field:pandas.DataFrame.from_dict({code:data[code][field].T
+                                                               for code in data.keys()})
+                             for field in fields})
+    else:
+        return pandas.Panel()
 
 
-def _fetch_data(security, start_date="2015-01-01", end_date="2015-12-31", frequency='daily',
-    fields=None, skip_paused=False, fq='pre', count=None):
+
+def _fetch_data(security_code, start_date="2015-01-01", end_date="2015-12-31", frequency='daily',
+                fields=None, skip_paused=False, fq='pre', count=None):
     """
     从线上与线下获取数据并完成相关操作
     """
-    data = _load_data_from_cache(security, start_date=start_date,
-                                end_date=end_date, frequency=frequency, fields=fields,
-                                skip_paused=skip_paused, fq=fq, count=count)
-    if data.empty:
-        # 本地缓存未命中，获取在线数据并缓存
-        origin_data, data = _load_online_data(security, start_date=start_date,
-                                 end_date=end_date, frequency=frequency, fields=fields,
-                                 skip_paused=skip_paused, fq=fq, count=count)
+    default_fields = ["open", "close", "low", "high", "volume", "money"]
+    if fields:
+        cols = ["pre_fq_factor", "post_fq_factor"] + fields
+    else:
+        cols = ["pre_fq_factor", "post_fq_factor"] + default_fields
+
+    data = _load_data_from_cache(security_code, start_date=start_date,
+                                 end_date=end_date, frequency=frequency, fields=cols,
+                                 skip_paused=skip_paused, count=count)
+
+    missing = list(sorted(set(_get_trading_time(security_code, start_date=start_date,
+                                           end_date=end_date, frequency=frequency)) - set(data.index)))
+    if missing:
+        # 本地缓存未完全命中，获取在线数据并缓存
+        # 为确保有足够的数据进行重采样，将额外获取部分数据
+        origin_data = _load_online_data(security_code, start_date=(missing[0].to_pydatetime() - timedelta(days=1)),
+                                        end_date=(missing[-1].to_pydatetime() + timedelta(days=1)), frequency=frequency, count=count)
         if not origin_data.empty:
-            _dump_data_to_cache(security, origin_data, frequency)
-    return data
+            _dump_data_to_cache(security_code, origin_data, frequency)
+
+        data = pandas.concat([data, origin_data[(origin_data.index >= missing[0]) & (origin_data.index <= missing[-1])]])
+        data.drop_duplicates(inplace=True)
+
+    if skip_paused:
+        data = resample_data(_process_fq(data[data["paused"] == False], fq),
+                                    frequency)
+    else:
+        data = resample_data(_process_fq(data, fq),
+                                    frequency)
+        data.drop(set(data.columns) - set(fields if fields else default_fields),
+                     axis=1, inplace=True)
+    return data.round(2)
+
+
+def _get_trading_time(security_code, start_date, end_date, frequency='daily'):
+    """
+    获取指定标的指定时段的交易时间
+    :param security_code: 标的代码，仅支持单只标的
+    :param start_date:
+    :param end_date:
+    :param frequency:
+    :return:
+    """
+    if not isinstance(security_code, str):
+        raise ValueError("仅支持单只标的代码")
+    resample_mutiple, base = normalize_frequency(frequency)
+    return list(JQDataClient.instance().get_price(security=security_code, start_date=start_date,
+                                                    end_date=end_date, frequency={"m": "1m", "d": "1d"}[base],
+                                                    fields=[], skip_paused=False, fq=None).index)
 
 
 def _get_h5_archive_file(base):
-    archive_file = {"d": "jqdatasdk_cache_1d.h5",
-                    "m": "jqdatasdk_cache_1m.h5"}[base]
+    archive_file = {"d": join(dirname(__file__), "cache/jqdatasdk_cache_1d.h5"),
+                    "m": join(dirname(__file__), "cache/jqdatasdk_cache_1m.h5")}[base]
+    if not exists(dirname(archive_file)):
+        makedirs(dirname(archive_file))
     return join(dirname(__file__), archive_file)
 
 
-def _dump_data_to_cache(security, data, frequency):
+def _dump_data_to_cache(security_code, data, frequency):
     resample_multiple, base = normalize_frequency(frequency)
-    data.to_hdf(_get_h5_archive_file(base), key=name_convertion(security), format="table",
+    # 去重
+    with pandas.HDFStore(_get_h5_archive_file(base)) as h5_storage:
+        try:
+            h5_storage.remove(name_convertion(security_code),
+                              where="index >= data.index[0] & index <= data.index[-1]")
+        except KeyError:
+            pass
+        finally:
+            h5_storage.append(key=name_convertion(security_code), value=data, format="table",
                 data_columns=["paused"], complevel=5)
 
 
-def _load_data_from_cache(security, start_date="2015-01-01", end_date="2015-12-31",
-                         frequency='daily', fields=None, skip_paused=False,
-                         fq='pre', count=None):
+def _load_data_from_cache(security_code, start_date="2015-01-01", end_date="2015-12-31",
+                          frequency='daily', fields=None, skip_paused=False, count=None):
     """
     从缓存读取数据
-    :param security: 单只标的的字符串
+    :param security_code: 单只标的的字符串
     :param start_date:
     :param end_date:
     :param frequency:
     :param fields:
     :param skip_paused:
-    :param fq:
     :param count:
     :return:
     """
-    scrty = convert_security(security)
+    LOGGER.debug("Fetch data for {0} from cache.".format(security_code))
+    scrty = convert_security(security_code)
     start = to_date_str(start_date)
     end = to_date_str(end_date) if end_date else "2015-12-31"
     if (not count) and (not start_date):
@@ -108,45 +162,32 @@ def _load_data_from_cache(security, start_date="2015-01-01", end_date="2015-12-3
 
     resample_multiple, base = normalize_frequency(frequency)
     archive_file = _get_h5_archive_file(base)
-    default_fields = ["open", "close", "low", "high", "volume", "money"]
-    if fields:
-        cols = ["pre_fq_factor", "post_fq_factor"] + fields
-    else:
-        cols = ["pre_fq_factor", "post_fq_factor"] + default_fields
     try:
         # 利用pandas自带机制过滤出需要的数据
         if not count:
             query = "index>={0} & index<={1}".format(
-                pd.Timestamp(start).to_datetime64().astype(datetime),
-                pd.Timestamp(end).to_datetime64().astype(datetime))
-            cached_data = pd.read_hdf(archive_file, key=name_convertion(scrty),
-                                      where=query, columns=cols)
+                pandas.Timestamp(start).to_datetime64().astype(datetime),
+                pandas.Timestamp(end).to_datetime64().astype(datetime))
+            cached_data = pandas.read_hdf(archive_file, key=name_convertion(scrty),
+                                      where=query, columns=fields)
         else:
             query = "index<={0})".format(
-                pd.Timestamp(end).to_datetime64().astype(datetime),
+                pandas.Timestamp(end).to_datetime64().astype(datetime),
                 skip_paused)
-            cached_data = pd.read_hdf(archive_file, key=name_convertion(scrty),
-                                      where=query, columns=cols)[-count:]
+            cached_data = pandas.read_hdf(archive_file, key=name_convertion(scrty),
+                                      where=query, columns=fields)[-count:]
     except (KeyError, IOError):
-        return pandas.DataFrame(columns=cols)
+        return pandas.DataFrame(columns=fields)
     else:
-        if skip_paused:
-            cached_data = resample_data(_process_fq(cached_data[cached_data["paused"] == False], fq),
-                                        frequency)
-        else:
-            cached_data = resample_data(_process_fq(cached_data, fq),
-                                        frequency)
-        cached_data.drop(set(cached_data.columns) - set(fields if fields else default_fields),
-                         axis=1,inplace=True)
-        return cached_data.round(2)
+        LOGGER.debug("{0} fetched from cache for {1}".format(len(cached_data), security_code))
+        return cached_data
 
 
-def _load_online_data(security, start_date="2015-01-01", end_date="2015-12-31",
-                         frequency='daily', fields=None, skip_paused=False,
-                         fq='pre', count=None):
+def _load_online_data(security_code, start_date="2015-01-01", end_date="2015-12-31",
+                      frequency='daily', count=None):
     """
     读取在线数据， 返回可供缓存的数据以及加工过的数据。
-    :param security: 单只标的的字符串
+    :param security_code: 单只标的的字符串
     :param start_date:
     :param end_date:
     :param frequency:
@@ -156,9 +197,10 @@ def _load_online_data(security, start_date="2015-01-01", end_date="2015-12-31",
     :param count:
     :return: (供缓存的数据， 加工过的数据)
     """
+    LOGGER.debug("Fetch data for {0} from online server".format(security_code))
     full_fields = ["open", "close", "low", "high", "volume", "money",
                    "high_limit", "low_limit", "pre_close", "paused"]
-    scrty = convert_security(security)
+    scrty = convert_security(security_code)
     start = to_date_str(start_date)
     end = to_date_str(end_date)
     if (not count) and (not start_date):
@@ -181,22 +223,10 @@ def _load_online_data(security, start_date="2015-01-01", end_date="2015-12-31",
     origin_data["pre_fq_factor"] = pre_fq_factor
     origin_data["post_fq_factor"] = post_fq_factor
 
-    if skip_paused:
-        data = resample_data(_process_fq(origin_data[origin_data["paused"] == False], fq),
-                             frequency)
-
-    else:
-        data = resample_data(_process_fq(origin_data, fq),
-                             frequency)
-
-    if fields:
-        return (origin_data, data.drop(set(data.columns) - set(fields), axis=1).round(2))
-    else:
-        return (origin_data, data.drop(set(data.columns) - {"open", "close", "low",
-                                              "high", "volume", "money"}, axis=1).round(2))
+    LOGGER.debug("{0} fetched from online server for {1}".format(len(origin_data), security_code))
+    return origin_data
 
 
-# Todo: 处理周期重采样
 def resample_data(data, frequency):
     """
     对数据进行重采样
@@ -208,25 +238,23 @@ def resample_data(data, frequency):
     if resample_multiple == 1:
         return data
     else:
-        raise NotImplemented
-        """
         fields_to_drop = ["factor", "high_limit", "low_limit", "pre_close", "paused"]
-        resample_period = resample_multiple + "min" if base == "m" else base
-        data_to_resample = data.drop(fields_to_drop, axis=1)
-        data_to_resample["bar_time"] = list(data_to_resample.index)
+        data_to_resample = data.drop(set(fields_to_drop) & set(data.columns), axis=1)
         result = pandas.DataFrame()
-        result["bar_time"] = data_to_resample["bar_time"].resample(resample_period).first()
-        result["open"] = data_to_resample["open"].resample(resample_period).first()
-        result["close"] = data_to_resample["close"].resample(resample_period).last()
-        result["high"] = data_to_resample["high"].resample(resample_period).max()
-        result["low"] = data_to_resample["low"].resample(resample_period).min()
-        result["volume"] = data_to_resample["volume"].resample(resample_period).sum()
-        result["money"] = data_to_resample["money"].resample(resample_period).sum()
-        result.set_index("bar_time", inplace=True)
-        result.index.name = None
-        result.dropna(inplace=True)
+        new_int_index = range(0, len(data_to_resample), resample_multiple)
+        # 无法使用pandas自带的resample
+        resamplers = {
+            "open": (lambda v: [v[i] for i in new_int_index]),
+            "close": (lambda v: [v[min(i + resample_multiple - 1, len(v) - 1)]  for i in new_int_index]),
+            "high": (lambda v: [max(v[i:i + resample_multiple]) for i in new_int_index]),
+            "low": (lambda v: [min(v[i:i + resample_multiple]) for i in new_int_index]),
+            "volume": (lambda v: [sum(v[i:i + resample_multiple]) for i in new_int_index]),
+            "money": (lambda v: [sum(v[i:i + resample_multiple]) for i in new_int_index]),
+            "index": (lambda v: [v[min(i + resample_multiple - 1, len(v) - 1)]  for i in new_int_index])}
+        for col in data_to_resample.columns:
+            result[col] = resamplers[col](data_to_resample[col])
+        result.index = resamplers["index"](data_to_resample.index)
         return  result
-        """
 
 
 def _process_fq(data, fq):
@@ -235,21 +263,24 @@ def _process_fq(data, fq):
         if "factor" not in df:
             raise AttributeError("找不到复权因子")
         else:
-            return df.apply(lambda x: pandas.Series({"open": x["open"] * x["factor"],
-                                                 "close": x["close"] * x["factor"],
-                                                 "low": x["low"] * x["factor"],
-                                                 "high": x["high"] * x["factor"],
-                                                 "volume": x["volume"] * x["factor"],
-                                                 "money": x["money"],
-                                                 "factor": x["factor"],
-                                                 "high_limit": x["high_limit"] * x["factor"],
-                                                 "low_limit": x["low_limit"] * x["factor"],
-                                                 "pre_close": x["pre_close"] * x["factor"],
-                                                 "paused": x["paused"]}, index=x.index), axis=1)
+            # 复权算法： value *  factor
+            apply_vector = {"open": lambda v: v["open"] * v["factor"],
+                            "close": lambda v: v["close"] * v["factor"],
+                            "low": lambda v: v["low"] * v["factor"],
+                            "high": lambda v: v["high"] * v["factor"],
+                            "volume": lambda v: v["volume"] * v["factor"],
+                            "money": lambda v: v["money"],
+                            "factor": lambda v: v["factor"],
+                            "high_limit": lambda v: v["high_limit"] * v["factor"],
+                            "low_limit": lambda v: v["low_limit"] * v["factor"],
+                            "pre_close": lambda v: v["pre_close"] * v["factor"],
+                            "paused": lambda v: v["paused"]}
+            return df.apply(lambda x: pandas.Series({label: apply_vector[label](x) for label in x.index}, index=x.index), axis=1)
 
     # 不复权
     if not fq:
-        result = data.drop(("pre_fq_factor", "post_fq_factor"), axis=1)
+        # 神坑：lables不可为Tuple
+        result = data.drop(["pre_fq_factor", "post_fq_factor"], axis=1)
         result["factor"] = list(1 for _ in range(len(result)))
         return result
     # 前复权
