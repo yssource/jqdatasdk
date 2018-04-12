@@ -8,6 +8,7 @@ import time
 from os import path
 import platform
 import sys
+import pandas as pd
 
 
 thrift_path = path.join(sys.modules["ROOT_DIR"], "jqdata.thrift")
@@ -51,7 +52,7 @@ class JQDataClient(object):
                 raise self.get_error(response)
             else:
                 self.__class__._instance = self
-                print("auth success")
+                #print("auth success")
 
     def _reset(self):
         if self.client:
