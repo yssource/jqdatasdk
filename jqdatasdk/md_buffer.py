@@ -26,7 +26,7 @@ def fetch_data(security_code, start_date="2015-01-01", end_date="2015-12-31", fr
     """
     从线上与线下获取数据并完成相关操作
     """
-    default_fields = ["open", "close", "low", "high", "volume", "money"]
+    default_fields = ["open", "close", "high", "low", "volume", "money"]
     if fields:
         cols = ["pre_fq_factor", "post_fq_factor"].extend(fields)
     else:
@@ -156,7 +156,7 @@ def _load_online_data(security_code, start_date="2015-01-01", end_date="2015-12-
     :param count:
     :return: (供缓存的数据， 加工过的数据)
     """
-    full_fields = ["open", "close", "low", "high", "volume", "money",
+    full_fields = ["open", "close", "high", "low", "volume", "money",
                    "high_limit", "low_limit", "pre_close", "paused"]
     scrty = convert_security(security_code)
     start = to_date_str(start_date)
@@ -223,8 +223,8 @@ def _process_fq(data, fq):
             # 复权算法： value *  factor
             apply_vector = {"open": lambda v: v["open"] * v["factor"],
                             "close": lambda v: v["close"] * v["factor"],
-                            "low": lambda v: v["low"] * v["factor"],
                             "high": lambda v: v["high"] * v["factor"],
+                            "low": lambda v: v["low"] * v["factor"],
                             "volume": lambda v: v["volume"] / v["factor"],
                             "money": lambda v: v["money"],
                             "factor": lambda v: v["factor"],
