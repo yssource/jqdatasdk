@@ -32,8 +32,8 @@ def fetch_data(security_code, start_date="2015-01-01", end_date="2015-12-31", fr
     else:
         cols = ["pre_fq_factor", "post_fq_factor"].extend(default_fields)
 
-    data = _load_data_from_cache(security_code, start_date=start_date,
-                                 end_date=end_date, frequency=frequency, fields=cols,
+    data = _load_data_from_cache(security_code, start_date=pandas.Timestamp(start_date).to_pydatetime() - timedelta(days=1),
+                                 end_date=pandas.Timestamp(end_date).to_pydatetime() - timedelta(days=1), frequency=frequency, fields=cols,
                                  skip_paused=skip_paused, count=count)
 
     missing = list(sorted(set(_get_trading_time(security_code, start_date=start_date,
@@ -57,7 +57,7 @@ def fetch_data(security_code, start_date="2015-01-01", end_date="2015-12-31", fr
                                     frequency)
         data.drop(set(data.columns) - set(fields if fields else default_fields),
                      axis=1, inplace=True)
-    return data.round(2)
+    return data[(data.index >= start_date) & (data.index <= end_date)].round(2)
 
 
 def _get_trading_time(security_code, start_date, end_date, frequency='daily'):
@@ -225,7 +225,7 @@ def _process_fq(data, fq):
                             "close": lambda v: v["close"] * v["factor"],
                             "low": lambda v: v["low"] * v["factor"],
                             "high": lambda v: v["high"] * v["factor"],
-                            "volume": lambda v: v["volume"] * v["factor"],
+                            "volume": lambda v: v["volume"] / v["factor"],
                             "money": lambda v: v["money"],
                             "factor": lambda v: v["factor"],
                             "high_limit": lambda v: v["high_limit"] * v["factor"],
