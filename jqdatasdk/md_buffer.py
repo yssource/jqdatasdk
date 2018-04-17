@@ -225,7 +225,7 @@ def _process_fq(data, fq):
                             "close": lambda v: v["close"] * v["factor"],
                             "low": lambda v: v["low"] * v["factor"],
                             "high": lambda v: v["high"] * v["factor"],
-                            "volume": lambda v: v["volume"] * v["factor"],
+                            "volume": lambda v: v["volume"] / v["factor"],
                             "money": lambda v: v["money"],
                             "factor": lambda v: v["factor"],
                             "high_limit": lambda v: v["high_limit"] * v["factor"],
