@@ -2,4 +2,4 @@
 *.pyc
 *.con
 *.out
-/*egg-info*/
+*.egg-info
