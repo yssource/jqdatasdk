@@ -26,6 +26,7 @@ class Macro(object):
                     names.append(table_file[:-3])
         return names
 
+    @assert_auth
     def run_query(self, query_object):
         from .client import JQDataClient
         if self.__disable_join:
