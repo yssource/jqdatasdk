@@ -2,8 +2,8 @@
 import zlib
 from .utils import *
 from .api import *
-import thriftpy
-from thriftpy.rpc import make_client
+import thriftpy2 as thriftpy
+from thriftpy2.rpc import make_client
 import msgpack
 import time
 from os import path
@@ -34,15 +34,16 @@ class JQDataClient(object):
             cls._threading_local._instance = _instance
         return _instance
 
-    def __init__(self, host, port, username="", password="", retry_cnt=5):
+    def __init__(self, host, port, username="", password="", token="", retry_cnt=5):
         assert host, "host is required"
         assert port, "port is required"
-        assert username, "username is required"
-        assert password, "password is required"
+        assert username or token, "username is required"
+        assert password or token, "password is required"
         self.host = host
         self.port = port
         self.username = username
         self.password = password
+        self.token = token
         self.client = None
         self.inited = False
         self.retry_cnt = retry_cnt
@@ -56,11 +57,14 @@ class JQDataClient(object):
 
     def ensure_auth(self):
         if not self.inited:
-            if not self.username:
+            if not self.username and not self.token:
                 raise RuntimeError("not inited")
             self.client = make_client(thrift.JqDataService, self.host, self.port)
             self.inited = True
-            response = self.client.auth(self.username, self.password, self.compress)
+            if self.username:
+                response = self.client.auth(self.username, self.password, self.compress)
+            else:
+                response = self.client.auth_by_token(self.token)
             if not response.status:
                 self._threading_local._instance = None
                 raise self.get_error(response)
@@ -74,6 +78,12 @@ class JQDataClient(object):
             self.client.close()
             self.client = None
         self.inited = False
+
+    def logout(self):
+        self._reset()
+        self._threading_local._instance = None
+        self.__class__._auth_params = {}
+        print("已退出")
 
     def get_error(self, response):
         err = None

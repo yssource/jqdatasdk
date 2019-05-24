@@ -3,6 +3,7 @@
 *.con
 *.out
 *.egg-info
+.*
 
 .mypy_cache/
 .breakpoints
