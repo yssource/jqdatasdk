@@ -3,3 +3,12 @@
 *.con
 *.out
 *.egg-info
+
+.mypy_cache/
+.breakpoints
+GPATH
+GRTAGS
+GTAGS
+.venv/
+Pipfile
+Pipfile.lock
